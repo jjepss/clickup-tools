@@ -5,8 +5,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (request.method === "POST" && url.pathname === "/webhook") {
-      return handleWebhook(request, env);
+    if (request.method === "POST" && (url.pathname === "/webhook" || url.pathname.startsWith("/webhook/"))) {
+      return handleWebhook(request, env, url);
     }
     if (request.method === "GET" && url.pathname === "/events") {
       return handleQuery(request, env, url);
@@ -21,27 +21,30 @@ export default {
   },
 };
 
-async function handleWebhook(request, env) {
+// ClickUp generates its own signing secret per webhook but never exposes it
+// via the API (masked in every response), so HMAC verification can't be
+// configured against ClickUp. Deliveries are authenticated instead by an
+// unguessable path token: POST /webhook/<token>. Senders that DO support
+// shared secrets can additionally set CLICKUP_WEBHOOK_SECRET(S), which are
+// then verified against X-Signature.
+async function handleWebhook(request, env, url) {
+  const providedToken = url.pathname.slice("/webhook".length).replace(/^\//, "");
+  const tokens = webhookPathTokens(env);
+  if (tokens.length === 0) {
+    return new Response("webhook endpoint not configured", { status: 503 });
+  }
+  if (!tokens.some((t) => timingSafeStringEqual(t, providedToken))) {
+    return new Response("not found", { status: 404 });
+  }
+
   const body = await request.text();
 
-  const signature = request.headers.get("X-Signature");
-  if (!(await verifySignature(body, signature, webhookSecrets(env)))) {
-    // TEMPORARY DEBUG — remove once webhook delivery is verified working.
-    const dbgSecret = webhookSecrets(env)[0] ?? "";
-    const dbgKey = await crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(dbgSecret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-    const dbgMac = await crypto.subtle.sign("HMAC", dbgKey, new TextEncoder().encode(body));
-    const dbgExpected = Array.from(new Uint8Array(dbgMac))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-    console.log("SIGDEBUG " + JSON.stringify({ provided: signature ?? null, expected: dbgExpected, secretLen: dbgSecret.length, bodyLen: body.length }));
-    console.log("SIGBODY " + body);
-    return new Response("bad signature", { status: 401 });
+  const secrets = webhookSecrets(env);
+  if (secrets.length > 0) {
+    const signature = request.headers.get("X-Signature");
+    if (!(await verifySignature(body, signature, secrets))) {
+      return new Response("bad signature", { status: 401 });
+    }
   }
 
   let payload;
@@ -91,6 +94,11 @@ function isAuthorized(request, env) {
 // Each webhook registration has its own signing secret. Support many
 // (multi-workspace) via CLICKUP_WEBHOOK_SECRETS="s1,s2", falling back to the
 // singular CLICKUP_WEBHOOK_SECRET for single-workspace setups.
+function webhookPathTokens(env) {
+  const raw = env.WEBHOOK_PATH_TOKENS || env.WEBHOOK_PATH_TOKEN || "";
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 function webhookSecrets(env) {
   if (env.CLICKUP_WEBHOOK_SECRETS) {
     return env.CLICKUP_WEBHOOK_SECRETS.split(",").map((s) => s.trim()).filter(Boolean);
@@ -162,7 +170,8 @@ async function handleQuery(request, env, url) {
   return Response.json({ events: results, truncated: results.length === 1000 });
 }
 
-// ClickUp signs the raw request body with the webhook secret:
+// For senders that support shared-secret signing (ClickUp itself does not
+// expose its secret — see the note on handleWebhook):
 // X-Signature = hex(HMAC-SHA256(body, secret))
 async function verifySignature(body, signature, secrets) {
   if (!signature || secrets.length === 0) return false;

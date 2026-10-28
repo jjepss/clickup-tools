@@ -11,7 +11,7 @@ someone moves a card in ClickUp
         │
         ▼  ClickUp delivers a signed webhook event
 clickup-logger (Cloudflare Worker)
-        │  verifies it's really ClickUp, then stores the event
+        │  checks it's authorized, then stores the event
         ▼
 Your D1 database — query it anytime via a simple HTTP endpoint
 ```
@@ -44,17 +44,18 @@ It prints a `database_id` — paste it into `wrangler.toml`, replacing `REPLACE_
 npx wrangler d1 execute clickup-events --remote --file=schema.sql
 ```
 
-**4. Choose a read token** — this protects your data when you query it later. Generate a good one:
-```sh
-openssl rand -hex 32
-npx wrangler secret put READ_TOKEN   # paste the generated value
-```
-
-**5. Deploy:**
+**4. Deploy** — this creates the Worker. (Secrets can only be attached to a Worker that already exists, so deploy comes first.)
 ```sh
 npx wrangler deploy
 ```
 Note your URL: `https://clickup-logger.<you>.workers.dev`
+
+**5. Choose a read token** — this protects your data when you query it later. Generate a good one:
+```sh
+openssl rand -hex 32
+npx wrangler secret put READ_TOKEN   # paste the generated value
+```
+The upload updates your deployed Worker with the new secret — no second deploy needed.
 
 **6. Check it's alive:**
 ```sh
@@ -63,19 +64,26 @@ curl https://clickup-logger.<you>.workers.dev/health
 
 ## Connect ClickUp
 
-Find your workspace ID with `GET https://api.clickup.com/api/v2/team`, then register the webhook:
+**1. Generate a webhook token** — this is what keeps impostors out. (ClickUp signs deliveries with a per-webhook secret, but it doesn't expose that secret via the API — it's masked in every response — so clickup-logger gives your webhook an unguessable URL instead.)
+
+```sh
+openssl rand -hex 32
+```
+
+**2. Store it in the Worker:**
+```sh
+npx wrangler secret put WEBHOOK_PATH_TOKENS   # paste the generated value
+```
+
+**3. Register the webhook** — note the token at the end of the URL. Find your workspace ID with `GET https://api.clickup.com/api/v2/team`:
 
 ```sh
 curl -s -X POST -H "Authorization: $CLICKUP_API_TOKEN" -H "Content-Type: application/json" \
   https://api.clickup.com/api/v2/team/<team_id>/webhook \
-  --data '{"endpoint":"https://clickup-logger.<you>.workers.dev/webhook","events":["taskStatusUpdated"]}'
+  --data '{"endpoint":"https://clickup-logger.<you>.workers.dev/webhook/<token>","events":["taskStatusUpdated"]}'
 ```
 
-The response includes a `secret` — ClickUp signs every delivery with it, so your Worker can reject impostors. Store it:
-
-```sh
-npx wrangler secret put CLICKUP_WEBHOOK_SECRET
-```
+Only deliveries carrying the exact token are accepted; everything else gets a 404.
 
 ## Try it out
 
@@ -111,10 +119,10 @@ curl -s -X PUT -H "Authorization: $CLICKUP_API_TOKEN" -H "Content-Type: applicat
 
 (Find your `<webhook_id>` with `GET /team/<team_id>/webhook`.)
 
-**More workspaces.** One Worker can serve many workspaces — register a webhook in each, all pointing at the same URL. Each registration has its own signing secret, so store them all, comma-separated:
+**More workspaces.** One Worker can serve many workspaces — register a webhook in each, and give each registration its own token (`openssl rand -hex 32` per workspace). Store them all, comma-separated:
 
 ```sh
-npx wrangler secret put CLICKUP_WEBHOOK_SECRETS   # value: secret1,secret2,...
+npx wrangler secret put WEBHOOK_PATH_TOKENS   # value: token1,token2,...
 ```
 
 Each stored row carries the `webhook_id` it arrived on — keep a note of which ID belongs to which workspace.
@@ -134,6 +142,7 @@ npx wrangler d1 execute clickup-events --remote \
 - **Brief outages can lose events.** ClickUp retries failed deliveries only briefly.
 - **Some events have no before/after.** Deletions (like `taskDeleted`) arrive without details; they're stored with the raw payload intact.
 - **Your data stays yours.** Events live in your Cloudflare account; the read token is the only key.
+- **Why a URL token instead of a signature?** ClickUp signs each delivery with a per-webhook secret, but never shows you that secret (masked in every API response), so it can't be verified against. The unguessable token in the webhook URL is what authenticates deliveries instead.
 
 ## License
 
