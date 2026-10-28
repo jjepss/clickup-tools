@@ -26,6 +26,21 @@ async function handleWebhook(request, env) {
 
   const signature = request.headers.get("X-Signature");
   if (!(await verifySignature(body, signature, webhookSecrets(env)))) {
+    // TEMPORARY DEBUG — remove once webhook delivery is verified working.
+    const dbgSecret = webhookSecrets(env)[0] ?? "";
+    const dbgKey = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(dbgSecret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const dbgMac = await crypto.subtle.sign("HMAC", dbgKey, new TextEncoder().encode(body));
+    const dbgExpected = Array.from(new Uint8Array(dbgMac))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    console.log("SIGDEBUG " + JSON.stringify({ provided: signature ?? null, expected: dbgExpected, secretLen: dbgSecret.length, bodyLen: body.length }));
+    console.log("SIGBODY " + body);
     return new Response("bad signature", { status: 401 });
   }
 
