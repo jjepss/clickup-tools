@@ -90,8 +90,9 @@ function timingSafeStringEqual(a, b) {
   return crypto.subtle.timingSafeEqual(ba, bb);
 }
 
-// D1 free tier is 5 GB. Warn threshold is configurable via wrangler.toml [vars].
-const SIZE_LIMIT_BYTES = 5 * 1024 * 1024 * 1024;
+// D1 free tier caps a single database at 500 MB (5 GB is the per-account
+// total across all databases). Warn threshold configurable via wrangler.toml.
+const SIZE_LIMIT_BYTES = 500 * 1024 * 1024;
 const DEFAULT_WARN_RATIO = 0.9;
 
 async function handleStats(request, env) {

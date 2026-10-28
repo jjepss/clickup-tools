@@ -121,7 +121,7 @@ Each stored row carries the `webhook_id` it arrived on — keep a note of which 
 
 ## Housekeeping
 
-The free D1 tier holds 5 GB — millions of events, so you may never need this section. `/stats` warns you (`warn: true`) once you pass 90% (tunable via `WARN_RATIO` in `wrangler.toml`). To prune old events:
+The free D1 tier caps one database at 500 MB — at ~1–2 KB per event that's still hundreds of thousands of events, so you may never need this section. `/stats` warns you (`warn: true`) once you pass 90% (tunable via `WARN_RATIO` in `wrangler.toml`). To prune old events:
 
 ```sh
 npx wrangler d1 execute clickup-events --remote \

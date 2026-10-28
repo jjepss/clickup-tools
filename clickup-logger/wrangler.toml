@@ -2,7 +2,7 @@ name = "clickup-logger"
 main = "src/index.js"
 compatibility_date = "2026-10-10"
 
-# Non-secret config. WARN_RATIO = fraction of D1's 5 GB free tier at which /stats returns warn: true.
+# Non-secret config. WARN_RATIO = fraction of D1's free-tier per-database limit (500 MB) at which /stats returns warn: true.
 [vars]
 WARN_RATIO = "0.9"
 
