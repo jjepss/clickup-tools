@@ -101,7 +101,7 @@ You'll see who changed what, with before/after values and timestamps. That's the
 
 | Endpoint | What it gives you |
 |----------|-------------------|
-| `GET /events?from=<ms>&to=<ms>` | Events in a time range (add `&user_id=<id>` to filter by person). Max 1000 per call — if the response says `truncated: true`, re-query starting from the last event's `date_ms` + 1. |
+| `GET /events?from=<ms>&to=<ms>` | Events in a time range. Add `&user_id=<id>` to filter by person, `&team_id=<id>` to filter by workspace. Max 1000 per call — if the response says `truncated: true`, re-query starting from the last event's `date_ms` + 1. |
 | `GET /stats` | How much you've logged and how full the database is. |
 | `GET /health` | Just a liveness ping. |
 
@@ -119,13 +119,13 @@ curl -s -X PUT -H "Authorization: $CLICKUP_API_TOKEN" -H "Content-Type: applicat
 
 (Find your `<webhook_id>` with `GET /team/<team_id>/webhook`.)
 
-**More workspaces.** One Worker can serve many workspaces — register a webhook in each, and give each registration its own token (`openssl rand -hex 32` per workspace). Store them all, comma-separated:
+**More workspaces.** One Worker can serve many workspaces — register a webhook in each, pointing at the same tokened URL (or give each workspace its own token for extra separation; store multiple tokens comma-separated):
 
 ```sh
 npx wrangler secret put WEBHOOK_PATH_TOKENS   # value: token1,token2,...
 ```
 
-Each stored row carries the `webhook_id` it arrived on — keep a note of which ID belongs to which workspace.
+Every stored event records the `team_id` it belongs to, so reports can filter by workspace without any lookup tables.
 
 ## Housekeeping
 

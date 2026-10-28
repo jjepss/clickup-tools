@@ -63,14 +63,15 @@ async function handleWebhook(request, env, url) {
   for (const item of items) {
     await env.DB.prepare(
       `INSERT OR IGNORE INTO events
-         (id, event, webhook_id, task_id, date_ms, field, user_id, username, before_json, after_json, raw_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (id, event, webhook_id, task_id, team_id, date_ms, field, user_id, username, before_json, after_json, raw_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         String(item.id ?? crypto.randomUUID()),
         String(payload.event ?? "unknown"),
         payload.webhook_id != null ? String(payload.webhook_id) : null,
         payload.task_id != null ? String(payload.task_id) : null,
+        payload.team_id != null ? Number(payload.team_id) : null,
         Number(item.date ?? Date.now()),
         item.field != null ? String(item.field) : null,
         item.user?.id != null ? Number(item.user.id) : null,
@@ -154,13 +155,18 @@ async function handleQuery(request, env, url) {
   const from = Number(url.searchParams.get("from") || 0);
   const to = Number(url.searchParams.get("to") || Date.now());
   const userId = url.searchParams.get("user_id");
+  const teamId = url.searchParams.get("team_id");
 
-  let sql = `SELECT id, event, webhook_id, task_id, date_ms, field, user_id, username, before_json, after_json
+  let sql = `SELECT id, event, webhook_id, task_id, team_id, date_ms, field, user_id, username, before_json, after_json
              FROM events WHERE date_ms >= ? AND date_ms < ?`;
   const binds = [from, to];
   if (userId) {
     sql += " AND user_id = ?";
     binds.push(Number(userId));
+  }
+  if (teamId) {
+    sql += " AND team_id = ?";
+    binds.push(Number(teamId));
   }
   sql += " ORDER BY date_ms ASC LIMIT 1000";
 
