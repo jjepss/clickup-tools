@@ -51,7 +51,7 @@ npx wrangler d1 execute clickup-events --remote --command "CREATE TABLE IF NOT E
 npx wrangler d1 execute clickup-events --remote --command "INSERT INTO d1_migrations (name) VALUES ('0001_init.sql'), ('0002_add_team_id.sql')"
 ```
 
-New schema changes after this go through migrations: `npm run db:migrate:new`, edit the generated file in `migrations/`, commit it, and `npm run db:migrate` applies whatever hasn't run yet. Never edit a migration that has already been applied.
+New schema changes after this go through migrations: `npm run db:migrate:new -- descriptive_name` (wrangler requires the migration name, so the `--` argument is part of the command), edit the generated file in `migrations/`, commit it, and `npm run db:migrate` applies whatever hasn't run yet. Never edit a migration that has already been applied.
 
 **4. Deploy** — this creates the Worker. (Secrets can only be attached to a Worker that already exists, so deploy comes first.)
 ```sh

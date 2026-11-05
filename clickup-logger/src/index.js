@@ -27,6 +27,16 @@ export default {
 // unguessable path token: POST /webhook/<token>. Senders that DO support
 // shared secrets can additionally set CLICKUP_WEBHOOK_SECRET(S), which are
 // then verified against X-Signature.
+// Fallback events (no history_items) carry no platform event id and no
+// timestamp of their own, so two genuinely distinct events can arrive as
+// byte-identical bodies. Their dedup key is the body hash plus a coarse
+// time bucket: a retry of a failed delivery lands well inside an hour, so
+// it collapses with the original, while a repeat of the same body in a
+// later bucket is kept as its own row. Trade-offs: an identical event
+// repeated within the same bucket still collapses, and a retry that
+// straddles a bucket boundary is stored twice.
+const DEDUP_BUCKET_MS = 60 * 60 * 1000;
+
 async function handleWebhook(request, env, url) {
   const providedToken = url.pathname.slice("/webhook".length).replace(/^\//, "");
   const tokens = webhookPathTokens(env);
@@ -58,18 +68,24 @@ async function handleWebhook(request, env, url) {
   if (items.length === 0) {
     // Some events (taskDeleted, spaceUpdated) carry no history_items.
     // Store one fallback row so the event isn't silently dropped. Its id is
-    // the SHA-256 of the raw body, so a redelivered identical payload maps
-    // to the same primary key and INSERT OR IGNORE drops the duplicate.
+    // the SHA-256 of the raw body plus a coarse time bucket: a redelivered
+    // identical payload lands in the same bucket, maps to the same primary
+    // key, and INSERT OR IGNORE drops the duplicate; the same body repeated
+    // in a later bucket is a distinct event and lands separately.
     items = [{ date: null, field: null, user: null, before: null, after: null }];
   }
   // Stable id for rows without a platform event id: redeliveries of the same
-  // body collide and are ignored; genuinely different bodies hash apart.
+  // body within the bucket collide and are ignored; genuinely different
+  // bodies hash apart, and the same body in a later bucket lands separately.
   const bodyHash = await sha256Hex(body);
+  const bucket = Math.floor(Date.now() / DEDUP_BUCKET_MS);
   let index = 0;
   for (const item of items) {
     const id = item.id != null
       ? String(item.id)
-      : items.length === 1 ? bodyHash : `${bodyHash}:${index}`;
+      : items.length === 1
+        ? `${bodyHash}:${bucket}`
+        : `${bodyHash}:${bucket}:${index}`;
     await env.DB.prepare(
       `INSERT OR IGNORE INTO events
          (id, event, webhook_id, task_id, team_id, date_ms, field, user_id, username, before_json, after_json, raw_json)

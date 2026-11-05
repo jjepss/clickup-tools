@@ -219,7 +219,7 @@ test('fallback events deduplicate on redelivery and hash apart on different bodi
     assert.equal((await webhook(env, deletion)).status, 200);  // same body again
     assert.equal(env.DB.rows.size, 1);
     const saved = [...env.DB.rows.values()][0];
-    assert.match(saved.id, /^[0-9a-f]{64}$/);
+    assert.match(saved.id, /^[0-9a-f]{64}:\d+$/);
     assert.equal(saved.event, 'taskDeleted');
     assert.equal(saved.user_id, null);
     assert.equal(saved.before_json, null);
@@ -237,7 +237,25 @@ test('history items without an id get a stable body-derived key', async () => {
     assert.equal((await webhook(env, payload)).status, 200);
     assert.equal((await webhook(env, payload)).status, 200);
     assert.equal(env.DB.rows.size, 1);
-    assert.match([...env.DB.rows.keys()][0], /^[0-9a-f]{64}$/);
+    assert.match([...env.DB.rows.keys()][0], /^[0-9a-f]{64}:\d+$/);
+});
+
+test('identical fallback bodies in later time buckets are distinct events', async () => {
+    const env = environment();
+    // spaceUpdated bodies carry no event id and no timestamp, so the same
+    // change repeated hours apart is byte-identical and must still store
+    // twice; only same-bucket redeliveries collapse.
+    const spaceUpdate = event({ event: 'spaceUpdated', task_id: null, history_items: [] });
+    const realNow = Date.now;
+    try {
+        Date.now = () => 5_000_000;
+        assert.equal((await webhook(env, spaceUpdate)).status, 200);
+        Date.now = () => 5_000_000 + 2 * 60 * 60 * 1000;  // two hours later
+        assert.equal((await webhook(env, spaceUpdate)).status, 200);
+    } finally {
+        Date.now = realNow;
+    }
+    assert.equal(env.DB.rows.size, 2);
 });
 
 test('signatures are enforced only when a signing secret is configured', async () => {
@@ -417,6 +435,21 @@ test('cursor identifiers remain bound data, including punctuation and SQL-like t
     assert.equal(response.status, 200);
     assert.deepEqual(env.DB.calls[0].values, [1000, 2000, 1000, 1000, id]);
     assert.ok(!env.DB.calls[0].sql.includes(id));
+});
+
+test('an encoded cursor id containing & excludes the boundary row exactly once', async () => {
+    // A consumer that interpolates after_id raw would let the & split the
+    // query string; the parsed cursor would then repeat the boundary event.
+    // With URL encoding, the cursor names one row and nothing repeats.
+    const env = environment([row('a-first', 1500), row('history&part=2', 1500), row('z-last', 1500)]);
+    const response = await request(
+        env,
+        '/events?from=1000&to=2000&after_date=1500&after_id=' + encodeURIComponent('history&part=2'),
+        { authorization: `Bearer ${env.READ_TOKEN}` });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.deepEqual(result.events.map(item => item.id), ['z-last']);
+    assert.deepEqual(env.DB.calls[0].values, [1000, 2000, 1500, 1500, 'history&part=2']);
 });
 
 test('stats report row count, date bounds, and a payload-based size estimate', async () => {
