@@ -212,7 +212,8 @@ test('repeated history identifiers are not stored twice', async () => {
     assert.equal(env.DB.rows.size, 1);
 });
 
-test('fallback events deduplicate on redelivery and hash apart on different bodies', async () => {
+test('fallback events deduplicate on redelivery and hash apart on different bodies', async t => {
+    t.mock.method(Date, 'now', () => 5_000_000);
     const env = environment();
     const deletion = event({ event: 'taskDeleted', history_items: [] });
     assert.equal((await webhook(env, deletion)).status, 200);
@@ -231,7 +232,8 @@ test('fallback events deduplicate on redelivery and hash apart on different bodi
     assert.equal(env.DB.rows.size, 2);
 });
 
-test('history items without an id get a stable body-derived key', async () => {
+test('history items without an id get a stable body-derived key', async t => {
+    t.mock.method(Date, 'now', () => 5_000_000);
     const env = environment();
     const payload = event({ history_items: [{ date: 1000, field: 'status', user: { id: 7, username: 'S' } }] });
     assert.equal((await webhook(env, payload)).status, 200);
@@ -255,6 +257,17 @@ test('identical fallback bodies in later time buckets are distinct events', asyn
     } finally {
         Date.now = realNow;
     }
+    assert.equal(env.DB.rows.size, 2);
+});
+
+test('fallback redelivery across an hourly boundary is stored twice', async t => {
+    let now = 60 * 60 * 1000 - 1;
+    t.mock.method(Date, 'now', () => now);
+    const env = environment();
+    const payload = event({ event: 'taskDeleted', history_items: [] });
+    assert.equal((await webhook(env, payload)).status, 200);
+    now += 1;
+    assert.equal((await webhook(env, payload)).status, 200);
     assert.equal(env.DB.rows.size, 2);
 });
 
