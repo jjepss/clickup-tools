@@ -503,6 +503,7 @@ test('continued pages stay on the original ingestion snapshot and include its bo
     const first = await (await request(env, '/events?from=1000&to=2000', { authorization })).json();
     assert.equal(first.truncated, true);
     assert.equal(first.next_cursor.snapshot_rowid, 1001);
+    assert.match(env.DB.calls[0].sql, /\(SELECT MAX\(rowid\) FROM events\) AS snapshot_rowid/);
     assert.ok(!Object.hasOwn(first.events[0], 'snapshot_rowid'));
 
     // Both rows arrive after the first page. One sorts before the cursor and
@@ -519,6 +520,8 @@ test('continued pages stay on the original ingestion snapshot and include its bo
     const secondResponse = await request(env,
         `${continuedPath}&snapshot_rowid=${cursor.snapshot_rowid}`, { authorization });
     assert.equal(secondResponse.status, 200);
+    assert.doesNotMatch(env.DB.calls[1].sql, /MAX\(rowid\)/,
+        'a continued query must use its bound snapshot instead of recomputing the high-water mark');
     const second = await secondResponse.json();
     assert.deepEqual(second.events.map(item => item.id), ['event-1000']);
     assert.equal(second.truncated, false);

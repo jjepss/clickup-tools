@@ -235,8 +235,10 @@ async function handleQuery(request, env, url) {
     return new Response("invalid event cursor", { status: 400 });
   }
 
-  let sql = `SELECT id, event, webhook_id, task_id, team_id, date_ms, field, user_id, username, before_json, after_json,
-                    (SELECT MAX(rowid) FROM events) AS snapshot_rowid
+  const snapshotSelect = snapshotRowId === null
+    ? ",\n                    (SELECT MAX(rowid) FROM events) AS snapshot_rowid"
+    : "";
+  let sql = `SELECT id, event, webhook_id, task_id, team_id, date_ms, field, user_id, username, before_json, after_json${snapshotSelect}
              FROM events WHERE date_ms >= ? AND date_ms < ?`;
   const binds = [from, to];
   if (userId !== null) {
