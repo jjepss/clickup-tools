@@ -29,8 +29,16 @@ after(() => {
 
 class MemoryDB {
     constructor(rows = []) {
-        this.rows = new Map(rows.map(row => [row.id, row]));
+        this.rows = new Map();
         this.calls = [];
+        this.nextRowId = 1;
+        for (const row of rows) this.insert(row);
+    }
+
+    insert(row) {
+        const stored = { ...row, rowid: row.rowid ?? this.nextRowId };
+        this.nextRowId = Math.max(this.nextRowId, stored.rowid + 1);
+        this.rows.set(stored.id, stored);
     }
 
     prepare(sql) {
@@ -46,14 +54,14 @@ class MemoryDB {
                 assert.match(sql, /INSERT OR IGNORE INTO events/);
                 const columns = sql.match(/\(([^)]+)\)\s*VALUES/)[1].split(',').map(value => value.trim());
                 const row = Object.fromEntries(columns.map((column, index) => [column, this.values[index]]));
-                if (!db.rows.has(row.id)) db.rows.set(row.id, row);
+                if (!db.rows.has(row.id)) db.insert(row);
                 return { success: true };
             },
             async first() {
                 db.calls.push({ operation: 'first', sql, values: this.values });
-                assert.match(sql, /AVG\(LENGTH\(raw_json\)\) AS avg_row_bytes/);
+                assert.match(sql, /AVG\(LENGTH\(CAST\(raw_json AS BLOB\)\)\) AS avg_row_bytes/);
                 const rows = [...db.rows.values()];
-                const lengths = rows.map(row => (row.raw_json ?? '').length);
+                const lengths = rows.map(row => Buffer.byteLength(row.raw_json ?? '', 'utf8'));
                 return {
                     row_count: rows.length,
                     oldest_ms: rows.length ? Math.min(...rows.map(row => row.date_ms)) : null,
@@ -82,12 +90,19 @@ class MemoryDB {
                     const [date, sameDate, id] = this.values.slice(position);
                     assert.equal(date, sameDate);
                     rows = rows.filter(row => row.date_ms > date || (row.date_ms === date && row.id > id));
+                    position += 3;
                 }
-                const columns = sql.match(/SELECT ([\s\S]+?)FROM events/)[1].split(',').map(value => value.trim());
+                if (sql.includes('AND rowid <= ?')) {
+                    rows = rows.filter(row => row.rowid <= this.values[position]);
+                }
+                const highWaterRowId = Math.max(0, ...[...db.rows.values()].map(row => row.rowid));
+                const columns = sql.match(/SELECT ([\s\S]+?)\s+FROM events WHERE/)[1].split(',').map(value => value.trim());
                 return {
                     results: rows.sort((a, b) => a.date_ms - b.date_ms || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
                         .slice(0, 1001)
-                        .map(row => Object.fromEntries(columns.map(column => [column, row[column] ?? null]))),
+                        .map(row => Object.fromEntries(columns.map(column => column === '(SELECT MAX(rowid) FROM events) AS snapshot_rowid'
+                            ? ['snapshot_rowid', highWaterRowId]
+                            : [column, row[column] ?? null]))),
                 };
             },
         };
@@ -315,6 +330,35 @@ test('signed invalid JSON stops without a database write', async () => {
     assert.deepEqual(env.DB.calls, []);
 });
 
+test('syntactically valid JSON values that are not objects are rejected without writes', async () => {
+    for (const body of ['null', 'true', '42', '"text"', '[]']) {
+        const env = environment();
+        const response = await webhook(env, body);
+        assert.equal(response.status, 400, body);
+        assert.equal(await response.text(), 'bad json');
+        assert.deepEqual(env.DB.calls, [], body);
+    }
+});
+
+test('null, non-array, and non-object history items are rejected without writes', async () => {
+    for (const historyItems of [null, {}, 'history', 42, true, [null], ['history'], [[]]]) {
+        const env = environment();
+        const response = await webhook(env, event({ history_items: historyItems }));
+        assert.equal(response.status, 400, JSON.stringify(historyItems));
+        assert.equal(await response.text(), 'bad history_items');
+        assert.deepEqual(env.DB.calls, [], JSON.stringify(historyItems));
+    }
+});
+
+test('a payload with history_items omitted still stores its fallback event', async () => {
+    const env = environment();
+    const { history_items, ...payload } = event({ event: 'taskDeleted' });
+    const response = await webhook(env, payload);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { stored: 1 });
+    assert.equal(env.DB.rows.size, 1);
+});
+
 test('event and stats reads reject missing or wrong authorization before querying', async () => {
     const env = environment();
     for (const path of ['/events', '/stats']) {
@@ -374,6 +418,34 @@ test('reads bind inclusive start, exclusive end, and optional user and team filt
     assert.deepEqual(env.DB.calls[2].values, [1000, 2000, 7, 9]);
 });
 
+test('invalid range and filter numbers are rejected before querying', async () => {
+    const env = environment();
+    for (const parameter of ['from', 'to', 'user_id', 'team_id']) {
+        for (const value of ['', 'no', 'NaN', '1.5', '1e3', '0x10', '+1', ' 1', 'Infinity', '9007199254740992']) {
+            const response = await request(env, `/events?${parameter}=${encodeURIComponent(value)}`, {
+                authorization: `Bearer ${env.READ_TOKEN}`,
+            });
+            assert.equal(response.status, 400, `${parameter}=${value}`);
+        }
+    }
+    assert.deepEqual(env.DB.calls, []);
+});
+
+test('negative and maximum safe integer parameters retain their existing semantics', async () => {
+    const env = environment();
+    const authorization = `Bearer ${env.READ_TOKEN}`;
+    const response = await request(env, '/events?from=-1000&to=9007199254740991&user_id=-7&team_id=0', {
+        authorization,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(env.DB.calls[0].values, [-1000, 9007199254740991, -7, 0]);
+
+    env.DB.calls = [];
+    assert.equal((await request(env, '/events', { authorization })).status, 200);
+    assert.equal(env.DB.calls[0].values[0], 0);
+    assert.ok(Number.isSafeInteger(env.DB.calls[0].values[1]));
+});
+
 test('unfiltered event reads are chronological and empty ranges are explicit', async () => {
     const env = environment([row('later', 2000, 8), row('earlier', 1000)]);
     const authorization = `Bearer ${env.READ_TOKEN}`;
@@ -393,7 +465,8 @@ test('the lookahead row reports remaining data without exceeding 1000 events', a
         const result = await response.json();
         assert.equal(result.events.length, Math.min(count, 1000));
         assert.equal(result.truncated, count > 1000);
-        assert.deepEqual(result.next_cursor, count > 1000 ? { date_ms: 999, id: 'event-999' } : null);
+        assert.deepEqual(result.next_cursor, count > 1000
+            ? { date_ms: 999, id: 'event-999', snapshot_rowid: count } : null);
     }
 });
 
@@ -413,7 +486,7 @@ test('cursor pagination retains every event sharing the boundary millisecond', a
             pages += 1;
             assert.ok(pages <= 3);
             cursor = result.truncated
-                ? `&after_date=${result.next_cursor.date_ms}&after_id=${encodeURIComponent(result.next_cursor.id)}` : '';
+                ? `&after_date=${result.next_cursor.date_ms}&after_id=${encodeURIComponent(result.next_cursor.id)}&snapshot_rowid=${result.next_cursor.snapshot_rowid}` : '';
             if (!cursor) assert.equal(result.next_cursor, null);
         } while (cursor);
         const expected = rows.map(item => item.id);
@@ -422,14 +495,59 @@ test('cursor pagination retains every event sharing the boundary millisecond', a
     }
 });
 
+test('continued pages stay on the original ingestion snapshot and include its boundary row', async () => {
+    const original = Array.from({ length: 1001 }, (_, index) =>
+        row(`event-${String(index).padStart(4, '0')}`, 1000));
+    const env = environment(original);
+    const authorization = `Bearer ${env.READ_TOKEN}`;
+    const first = await (await request(env, '/events?from=1000&to=2000', { authorization })).json();
+    assert.equal(first.truncated, true);
+    assert.equal(first.next_cursor.snapshot_rowid, 1001);
+    assert.ok(!Object.hasOwn(first.events[0], 'snapshot_rowid'));
+
+    // Both rows arrive after the first page. One sorts before the cursor and
+    // one after it; neither belongs to the original ingestion snapshot.
+    env.DB.insert(row('a-late-before-cursor', 1000));
+    env.DB.insert(row('z-late-after-cursor', 1000));
+    const cursor = first.next_cursor;
+    const continuedPath = `/events?from=1000&to=2000&after_date=${cursor.date_ms}&after_id=${encodeURIComponent(cursor.id)}`;
+    const missingSnapshot = await request(env, continuedPath, { authorization });
+    assert.equal(missingSnapshot.status, 400,
+        'a snapshot-less continuation must not query the now-changed table');
+    assert.equal(env.DB.calls.length, 1);
+
+    const secondResponse = await request(env,
+        `${continuedPath}&snapshot_rowid=${cursor.snapshot_rowid}`, { authorization });
+    assert.equal(secondResponse.status, 200);
+    const second = await secondResponse.json();
+    assert.deepEqual(second.events.map(item => item.id), ['event-1000']);
+    assert.equal(second.truncated, false);
+    assert.equal(env.DB.rows.get('event-1000').rowid, cursor.snapshot_rowid,
+        'the row exactly at the high-water mark must remain visible');
+    assert.deepEqual(env.DB.calls[1].values,
+        [1000, 2000, 1000, 1000, 'event-0999', 1001]);
+});
+
 test('invalid or partial cursors are rejected before querying', async () => {
     const env = environment();
     for (const cursor of [
-        'after_date=1000', 'after_id=event', 'after_date=&after_id=event',
-        'after_date=no&after_id=event', 'after_date=1.5&after_id=event',
+        'after_date=1000', 'after_id=event', 'after_date=1000&after_id=event',
+        'after_date=&after_id=event&snapshot_rowid=1',
+        'after_date=no&after_id=event&snapshot_rowid=1',
+        'after_date=1.5&after_id=event&snapshot_rowid=1',
+        'after_date=1e3&after_id=event&snapshot_rowid=1',
+        'after_date=-1&after_id=event&snapshot_rowid=1',
         // 2^53: one past Number.MAX_SAFE_INTEGER, so the safe-integer check trips.
-        'after_date=9007199254740992&after_id=event', 'after_date=1000&after_id=',
-        'after_date=999&after_id=event', 'after_date=2000&after_id=event',
+        'after_date=9007199254740992&after_id=event&snapshot_rowid=1',
+        'after_date=1000&after_id=&snapshot_rowid=1',
+        'after_date=999&after_id=event&snapshot_rowid=1',
+        'after_date=2000&after_id=event&snapshot_rowid=1',
+        'snapshot_rowid=1000', 'after_date=1000&after_id=event&snapshot_rowid=',
+        'after_date=1000&after_id=event&snapshot_rowid=no',
+        'after_date=1000&after_id=event&snapshot_rowid=1.5',
+        'after_date=1000&after_id=event&snapshot_rowid=1e3',
+        'after_date=1000&after_id=event&snapshot_rowid=-1',
+        'after_date=1000&after_id=event&snapshot_rowid=9007199254740992',
     ]) {
         const response = await request(env, '/events?from=1000&to=2000&' + cursor, {
             authorization: `Bearer ${env.READ_TOKEN}`,
@@ -439,14 +557,26 @@ test('invalid or partial cursors are rejected before querying', async () => {
     assert.deepEqual(env.DB.calls, []);
 });
 
+test('a zero snapshot cutoff is a valid nonnegative cursor value', async () => {
+    const env = environment();
+    const response = await request(env,
+        '/events?from=1000&to=2000&after_date=1000&after_id=event&snapshot_rowid=0', {
+            authorization: `Bearer ${env.READ_TOKEN}`,
+        });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { events: [], truncated: false, next_cursor: null });
+    assert.deepEqual(env.DB.calls[0].values, [1000, 2000, 1000, 1000, 'event', 0]);
+});
+
 test('cursor identifiers remain bound data, including punctuation and SQL-like text', async () => {
     const env = environment([row('z-last', 1000)]);
     const id = "' OR 1=1 --/?&";
-    const response = await request(env, '/events?from=1000&to=2000&after_date=1000&after_id=' + encodeURIComponent(id), {
-        authorization: `Bearer ${env.READ_TOKEN}`,
-    });
+    const response = await request(env,
+        '/events?from=1000&to=2000&after_date=1000&after_id=' + encodeURIComponent(id) + '&snapshot_rowid=1', {
+            authorization: `Bearer ${env.READ_TOKEN}`,
+        });
     assert.equal(response.status, 200);
-    assert.deepEqual(env.DB.calls[0].values, [1000, 2000, 1000, 1000, id]);
+    assert.deepEqual(env.DB.calls[0].values, [1000, 2000, 1000, 1000, id, 1]);
     assert.ok(!env.DB.calls[0].sql.includes(id));
 });
 
@@ -457,22 +587,27 @@ test('an encoded cursor id containing & excludes the boundary row exactly once',
     const env = environment([row('a-first', 1500), row('history&part=2', 1500), row('z-last', 1500)]);
     const response = await request(
         env,
-        '/events?from=1000&to=2000&after_date=1500&after_id=' + encodeURIComponent('history&part=2'),
+        '/events?from=1000&to=2000&after_date=1500&after_id=' + encodeURIComponent('history&part=2') + '&snapshot_rowid=3',
         { authorization: `Bearer ${env.READ_TOKEN}` });
     assert.equal(response.status, 200);
     const result = await response.json();
     assert.deepEqual(result.events.map(item => item.id), ['z-last']);
-    assert.deepEqual(env.DB.calls[0].values, [1000, 2000, 1500, 1500, 'history&part=2']);
+    assert.deepEqual(env.DB.calls[0].values, [1000, 2000, 1500, 1500, 'history&part=2', 3]);
 });
 
-test('stats report row count, date bounds, and a payload-based size estimate', async () => {
-    const env = environment([row('earlier', 1000), row('later', 2000)]);
+test('stats report row count, date bounds, and true UTF-8 payload bytes', async () => {
+    const ascii = '{"synthetic":true}';
+    const nonAscii = '{"note":"café 日本 😀"}';
+    const env = environment([
+        { ...row('earlier', 1000), raw_json: ascii },
+        { ...row('later', 2000), raw_json: nonAscii },
+    ]);
     const response = await request(env, '/stats', { authorization: `Bearer ${env.READ_TOKEN}` });
     assert.deepEqual(await response.json(), {
         row_count: 2,
         oldest_ms: 1000,
         newest_ms: 2000,
-        estimated_bytes: 2 * '{"synthetic":true}'.length,
+        estimated_bytes: Buffer.byteLength(ascii, 'utf8') + Buffer.byteLength(nonAscii, 'utf8'),
         limit_bytes: 500 * 1024 * 1024,
         usage_ratio: 0,
         warn: false,

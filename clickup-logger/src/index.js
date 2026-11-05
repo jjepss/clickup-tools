@@ -63,8 +63,15 @@ async function handleWebhook(request, env, url) {
   } catch {
     return new Response("bad json", { status: 400 });
   }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return new Response("bad json", { status: 400 });
+  }
 
-  let items = payload.history_items || [];
+  let items = payload.history_items === undefined ? [] : payload.history_items;
+  if (!Array.isArray(items)
+      || items.some((item) => item === null || typeof item !== "object" || Array.isArray(item))) {
+    return new Response("bad history_items", { status: 400 });
+  }
   if (items.length === 0) {
     // Some events (taskDeleted, spaceUpdated) carry no history_items.
     // Store one fallback row so the event isn't silently dropped. Its id is
@@ -165,7 +172,7 @@ async function handleStats(request, env) {
     `SELECT COUNT(*) AS row_count,
             MIN(date_ms) AS oldest_ms,
             MAX(date_ms) AS newest_ms,
-            AVG(LENGTH(raw_json)) AS avg_row_bytes
+            AVG(LENGTH(CAST(raw_json AS BLOB))) AS avg_row_bytes
      FROM events`
   ).first();
 
@@ -184,53 +191,85 @@ async function handleStats(request, env) {
   });
 }
 
+function parseSafeInteger(value) {
+  if (typeof value !== "string" || !/^-?\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
 async function handleQuery(request, env, url) {
   if (!isAuthorized(request, env)) {
     return new Response("unauthorized", { status: 401 });
   }
 
-  const from = Number(url.searchParams.get("from") || 0);
-  const to = Number(url.searchParams.get("to") || Date.now());
-  const userId = url.searchParams.get("user_id");
-  const teamId = url.searchParams.get("team_id");
-  const afterDate = url.searchParams.get("after_date");
+  const fromParam = url.searchParams.get("from");
+  const toParam = url.searchParams.get("to");
+  const from = fromParam === null ? 0 : parseSafeInteger(fromParam);
+  const to = toParam === null ? Date.now() : parseSafeInteger(toParam);
+  if (from === null || to === null) {
+    return new Response("invalid event range", { status: 400 });
+  }
+
+  const userIdParam = url.searchParams.get("user_id");
+  const teamIdParam = url.searchParams.get("team_id");
+  const userId = userIdParam === null ? null : parseSafeInteger(userIdParam);
+  const teamId = teamIdParam === null ? null : parseSafeInteger(teamIdParam);
+  if ((userIdParam !== null && userId === null) || (teamIdParam !== null && teamId === null)) {
+    return new Response("invalid event filter", { status: 400 });
+  }
+
+  const afterDateParam = url.searchParams.get("after_date");
   const afterId = url.searchParams.get("after_id");
+  const snapshotParam = url.searchParams.get("snapshot_rowid");
+  const afterDate = afterDateParam === null ? null : parseSafeInteger(afterDateParam);
+  const snapshotRowId = snapshotParam === null ? null : parseSafeInteger(snapshotParam);
   // Cursor pagination on (date_ms, id): timestamps alone are not a stable
   // cursor, because multiple events can share the boundary millisecond.
-  const hasCursor = afterDate !== null || afterId !== null;
-  if (hasCursor && (afterDate === null || !/^\d+$/.test(afterDate)
-      || !Number.isSafeInteger(Number(afterDate)) || Number(afterDate) < from
-      || Number(afterDate) >= to || !afterId)) {
+  // snapshot_rowid pins every continued page to the initial ingestion
+  // high-water mark. All three cursor fields are required so a continuation
+  // cannot fall back to an unpinned query that includes newly inserted rows.
+  const hasCursor = afterDateParam !== null || afterId !== null || snapshotParam !== null;
+  if (hasCursor && (afterDateParam === null || !/^\d+$/.test(afterDateParam)
+      || afterDate === null || afterDate < from || afterDate >= to || !afterId
+      || snapshotParam === null || !/^\d+$/.test(snapshotParam) || snapshotRowId === null)) {
     return new Response("invalid event cursor", { status: 400 });
   }
 
-  let sql = `SELECT id, event, webhook_id, task_id, team_id, date_ms, field, user_id, username, before_json, after_json
+  let sql = `SELECT id, event, webhook_id, task_id, team_id, date_ms, field, user_id, username, before_json, after_json,
+                    (SELECT MAX(rowid) FROM events) AS snapshot_rowid
              FROM events WHERE date_ms >= ? AND date_ms < ?`;
   const binds = [from, to];
-  if (userId) {
+  if (userId !== null) {
     sql += " AND user_id = ?";
-    binds.push(Number(userId));
+    binds.push(userId);
   }
-  if (teamId) {
+  if (teamId !== null) {
     sql += " AND team_id = ?";
-    binds.push(Number(teamId));
+    binds.push(teamId);
   }
   if (hasCursor) {
     sql += " AND (date_ms > ? OR (date_ms = ? AND id > ?))";
-    binds.push(Number(afterDate), Number(afterDate), afterId);
+    binds.push(afterDate, afterDate, afterId);
+  }
+  if (snapshotRowId !== null) {
+    sql += " AND rowid <= ?";
+    binds.push(snapshotRowId);
   }
   sql += " ORDER BY date_ms ASC, id ASC LIMIT 1001";
 
   // Fetch one extra row (LIMIT 1001): a 1001st row proves more data exists,
   // so `truncated` is true exactly when the consumer must continue.
   const { results } = await env.DB.prepare(sql).bind(...binds).all();
-  const events = results.slice(0, 1000);
+  const events = results.slice(0, 1000).map(({ snapshot_rowid, ...event }) => event);
   const truncated = results.length > 1000;
   const last = events[events.length - 1];
+  const nextSnapshotRowId = snapshotRowId ?? results[0]?.snapshot_rowid;
   return Response.json({
     events,
     truncated,
-    next_cursor: truncated && last ? { date_ms: last.date_ms, id: last.id } : null,
+    next_cursor: truncated && last
+      ? { date_ms: last.date_ms, id: last.id, snapshot_rowid: nextSnapshotRowId }
+      : null,
   });
 }
 

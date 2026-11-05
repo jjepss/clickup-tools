@@ -76,20 +76,25 @@ curl https://clickup-logger.<you>.workers.dev/health
 **1. Generate a webhook token** — this is what keeps impostors out. (ClickUp signs deliveries with a per-webhook secret, but it doesn't expose that secret via the API — it's masked in every response — so clickup-logger gives your webhook an unguessable URL instead.)
 
 ```sh
-openssl rand -hex 32
+WEBHOOK_PATH_TOKEN=$(openssl rand -hex 32)
 ```
 
 **2. Store it in the Worker:**
 ```sh
-npx wrangler secret put WEBHOOK_PATH_TOKENS   # paste the generated value
+printf '%s\n' "$WEBHOOK_PATH_TOKEN" | npx wrangler secret put WEBHOOK_PATH_TOKENS
 ```
 
-**3. Register the webhook** — note the token at the end of the URL. Find your workspace ID with `GET https://api.clickup.com/api/v2/team`:
+**3. Register the webhook** — note the token at the end of the URL. Find your workspace ID with `GET https://api.clickup.com/api/v2/team`. Enter your API token without saving it in shell history, then let curl read the request configuration from stdin so neither expanded token appears in curl's arguments:
 
 ```sh
-curl -s -X POST -H "Authorization: $CLICKUP_API_TOKEN" -H "Content-Type: application/json" \
-  https://api.clickup.com/api/v2/team/<team_id>/webhook \
-  --data '{"endpoint":"https://clickup-logger.<you>.workers.dev/webhook/<token>","events":["taskStatusUpdated"]}'
+read -rsp "ClickUp API token: " CLICKUP_API_TOKEN; echo
+curl -s --config - <<EOF
+request = "POST"
+url = "https://api.clickup.com/api/v2/team/<team_id>/webhook"
+header = "Authorization: $CLICKUP_API_TOKEN"
+header = "Content-Type: application/json"
+data = "{\"endpoint\":\"https://clickup-logger.<you>.workers.dev/webhook/$WEBHOOK_PATH_TOKEN\",\"events\":[\"taskStatusUpdated\"]}"
+EOF
 ```
 
 Only deliveries carrying the exact token are accepted; everything else gets a 404.
@@ -110,7 +115,7 @@ You'll see who changed what, with before/after values and timestamps. That's the
 
 | Endpoint | What it gives you |
 |----------|-------------------|
-| `GET /events?from=<ms>&to=<ms>` | Events in a time range. Add `&user_id=<id>` to filter by person, `&team_id=<id>` to filter by workspace. Max 1000 per call. If the response says `truncated: true`, it also carries a `next_cursor` — re-query with the same range and filters plus `&after_date=<next_cursor.date_ms>&after_id=<URL-encoded next_cursor.id>` until `truncated` is false. Don't page by `date_ms + 1`: multiple events can share a millisecond, and the cursor is what guarantees you don't skip any. |
+| `GET /events?from=<ms>&to=<ms>` | Events in a time range. Add `&user_id=<id>` to filter by person, `&team_id=<id>` to filter by workspace. Max 1000 per call. If the response says `truncated: true`, it also carries a `next_cursor` — re-query with the same range and filters plus `&after_date=<next_cursor.date_ms>&after_id=<URL-encoded next_cursor.id>&snapshot_rowid=<next_cursor.snapshot_rowid>` until `truncated` is false. The snapshot keeps events delivered during pagination out of later pages. Every continued request must include all three cursor fields; a cursor without `snapshot_rowid` is rejected. Don't page by `date_ms + 1`: multiple events can share a millisecond, and the cursor is what guarantees you don't skip any. |
 | `GET /stats` | How much you've logged and how full the database is. |
 | `GET /health` | Just a liveness ping. |
 
@@ -121,12 +126,18 @@ You'll see who changed what, with before/after values and timestamps. That's the
 **More event types.** Subscribe to comments, assignee changes, due dates and more — see the full list in [ClickUp's webhook docs](https://developer.clickup.com/docs/webhooks). Update your existing webhook:
 
 ```sh
-curl -s -X PUT -H "Authorization: $CLICKUP_API_TOKEN" -H "Content-Type: application/json" \
-  https://api.clickup.com/api/v2/webhook/<webhook_id> \
-  --data '{"endpoint":"<same url>","events":["taskStatusUpdated","taskAssigneeUpdated"],"status":"active"}'
+read -rsp "ClickUp API token: " CLICKUP_API_TOKEN; echo
+read -rsp "Webhook path token: " WEBHOOK_PATH_TOKEN; echo
+curl -s --config - <<EOF
+request = "PUT"
+url = "https://api.clickup.com/api/v2/webhook/<webhook_id>"
+header = "Authorization: $CLICKUP_API_TOKEN"
+header = "Content-Type: application/json"
+data = "{\"endpoint\":\"https://clickup-logger.<you>.workers.dev/webhook/$WEBHOOK_PATH_TOKEN\",\"events\":[\"taskStatusUpdated\",\"taskAssigneeUpdated\"],\"status\":\"active\"}"
+EOF
 ```
 
-(Find your `<webhook_id>` with `GET /team/<team_id>/webhook`.)
+(Find your `<webhook_id>` with `GET /team/<team_id>/webhook`.) As above, `read -s` and stdin configuration keep both tokens out of your shell history and curl's arguments.
 
 **More workspaces.** One Worker can serve many workspaces — register a webhook in each, pointing at the same tokened URL (or give each workspace its own token for extra separation; store multiple tokens comma-separated):
 
