@@ -57,17 +57,26 @@ async function handleWebhook(request, env, url) {
   let items = payload.history_items || [];
   if (items.length === 0) {
     // Some events (taskDeleted, spaceUpdated) carry no history_items.
-    // Store one fallback row so the event isn't silently dropped.
-    items = [{ id: crypto.randomUUID(), date: Date.now(), field: null, user: null, before: null, after: null }];
+    // Store one fallback row so the event isn't silently dropped. Its id is
+    // the SHA-256 of the raw body, so a redelivered identical payload maps
+    // to the same primary key and INSERT OR IGNORE drops the duplicate.
+    items = [{ date: null, field: null, user: null, before: null, after: null }];
   }
+  // Stable id for rows without a platform event id: redeliveries of the same
+  // body collide and are ignored; genuinely different bodies hash apart.
+  const bodyHash = await sha256Hex(body);
+  let index = 0;
   for (const item of items) {
+    const id = item.id != null
+      ? String(item.id)
+      : items.length === 1 ? bodyHash : `${bodyHash}:${index}`;
     await env.DB.prepare(
       `INSERT OR IGNORE INTO events
          (id, event, webhook_id, task_id, team_id, date_ms, field, user_id, username, before_json, after_json, raw_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
-        String(item.id ?? crypto.randomUUID()),
+        id,
         String(payload.event ?? "unknown"),
         payload.webhook_id != null ? String(payload.webhook_id) : null,
         payload.task_id != null ? String(payload.task_id) : null,
@@ -81,15 +90,20 @@ async function handleWebhook(request, env, url) {
         body
       )
       .run();
+    index += 1;
   }
 
   return Response.json({ stored: items.length });
 }
 
 function isAuthorized(request, env) {
+  // Fail closed: an unset READ_TOKEN must reject every read, including a
+  // request that literally sends "Authorization: Bearer undefined".
+  if (typeof env.READ_TOKEN !== "string" || !env.READ_TOKEN.trim()) {
+    return false;
+  }
   const auth = request.headers.get("Authorization") || "";
-  const expected = `Bearer ${env.READ_TOKEN}`;
-  return timingSafeStringEqual(auth, expected);
+  return timingSafeStringEqual(auth, `Bearer ${env.READ_TOKEN}`);
 }
 
 // Each webhook registration has its own signing secret. Support many
@@ -112,6 +126,13 @@ function timingSafeStringEqual(a, b) {
   const bb = new TextEncoder().encode(b);
   if (ba.byteLength !== bb.byteLength) return false;
   return crypto.subtle.timingSafeEqual(ba, bb);
+}
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 // D1 free tier caps a single database at 500 MB (5 GB is the per-account
@@ -156,6 +177,16 @@ async function handleQuery(request, env, url) {
   const to = Number(url.searchParams.get("to") || Date.now());
   const userId = url.searchParams.get("user_id");
   const teamId = url.searchParams.get("team_id");
+  const afterDate = url.searchParams.get("after_date");
+  const afterId = url.searchParams.get("after_id");
+  // Cursor pagination on (date_ms, id): timestamps alone are not a stable
+  // cursor, because multiple events can share the boundary millisecond.
+  const hasCursor = afterDate !== null || afterId !== null;
+  if (hasCursor && (afterDate === null || !/^\d+$/.test(afterDate)
+      || !Number.isSafeInteger(Number(afterDate)) || Number(afterDate) < from
+      || Number(afterDate) >= to || !afterId)) {
+    return new Response("invalid event cursor", { status: 400 });
+  }
 
   let sql = `SELECT id, event, webhook_id, task_id, team_id, date_ms, field, user_id, username, before_json, after_json
              FROM events WHERE date_ms >= ? AND date_ms < ?`;
@@ -168,12 +199,23 @@ async function handleQuery(request, env, url) {
     sql += " AND team_id = ?";
     binds.push(Number(teamId));
   }
-  sql += " ORDER BY date_ms ASC LIMIT 1000";
+  if (hasCursor) {
+    sql += " AND (date_ms > ? OR (date_ms = ? AND id > ?))";
+    binds.push(Number(afterDate), Number(afterDate), afterId);
+  }
+  sql += " ORDER BY date_ms ASC, id ASC LIMIT 1001";
 
+  // Fetch one extra row (LIMIT 1001): a 1001st row proves more data exists,
+  // so `truncated` is true exactly when the consumer must continue.
   const { results } = await env.DB.prepare(sql).bind(...binds).all();
-  // Machine consumers: a full page means there may be more data. Re-query
-  // with from = last row's date_ms + 1 to continue.
-  return Response.json({ events: results, truncated: results.length === 1000 });
+  const events = results.slice(0, 1000);
+  const truncated = results.length > 1000;
+  const last = events[events.length - 1];
+  return Response.json({
+    events,
+    truncated,
+    next_cursor: truncated && last ? { date_ms: last.date_ms, id: last.id } : null,
+  });
 }
 
 // For senders that support shared-secret signing (ClickUp itself does not

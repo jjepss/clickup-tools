@@ -1,12 +1,14 @@
 {
   "name": "clickup-logger",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "description": "Cloudflare Worker that logs ClickUp webhook events (currently taskStatusUpdated) to D1",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "db:migrate": "wrangler d1 execute clickup-events --remote --file=schema.sql"
+    "db:migrate": "wrangler d1 migrations apply clickup-events --remote",
+    "db:migrate:new": "wrangler d1 migrations create clickup-events",
+    "test": "node --test tests/*.test.cjs"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

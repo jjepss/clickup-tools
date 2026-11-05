@@ -41,8 +41,17 @@ It prints a `database_id` — paste it into `wrangler.toml`, replacing `REPLACE_
 
 **3. Create the events table:**
 ```sh
-npx wrangler d1 execute clickup-events --remote --file=schema.sql
+npx wrangler d1 migrations apply clickup-events --remote
 ```
+
+**Already installed before migrations existed?** If your database was set up with the old `schema.sql` and already has the `team_id` column, mark the two existing migrations as applied once, so `migrations apply` knows to skip them:
+
+```sh
+npx wrangler d1 execute clickup-events --remote --command "CREATE TABLE IF NOT EXISTS d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)"
+npx wrangler d1 execute clickup-events --remote --command "INSERT INTO d1_migrations (name) VALUES ('0001_init.sql'), ('0002_add_team_id.sql')"
+```
+
+New schema changes after this go through migrations: `npm run db:migrate:new`, edit the generated file in `migrations/`, commit it, and `npm run db:migrate` applies whatever hasn't run yet. Never edit a migration that has already been applied.
 
 **4. Deploy** — this creates the Worker. (Secrets can only be attached to a Worker that already exists, so deploy comes first.)
 ```sh
@@ -101,7 +110,7 @@ You'll see who changed what, with before/after values and timestamps. That's the
 
 | Endpoint | What it gives you |
 |----------|-------------------|
-| `GET /events?from=<ms>&to=<ms>` | Events in a time range. Add `&user_id=<id>` to filter by person, `&team_id=<id>` to filter by workspace. Max 1000 per call — if the response says `truncated: true`, re-query starting from the last event's `date_ms` + 1. |
+| `GET /events?from=<ms>&to=<ms>` | Events in a time range. Add `&user_id=<id>` to filter by person, `&team_id=<id>` to filter by workspace. Max 1000 per call. If the response says `truncated: true`, it also carries a `next_cursor` — re-query with the same range and filters plus `&after_date=<next_cursor.date_ms>&after_id=<URL-encoded next_cursor.id>` until `truncated` is false. Don't page by `date_ms + 1`: multiple events can share a millisecond, and the cursor is what guarantees you don't skip any. |
 | `GET /stats` | How much you've logged and how full the database is. |
 | `GET /health` | Just a liveness ping. |
 
